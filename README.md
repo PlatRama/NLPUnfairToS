@@ -16,8 +16,9 @@ This project investigates whether pseudo-labeling on unlabeled Terms of Service 
 6. [Pipeline](#pipeline)
 7. [Experiments](#experiments)
 8. [Results](#results)
-9. [Key Findings](#key-findings)
-10. [References](#references)
+9. [Confidence Threshold Ablation](#confidence-threshold-ablation)
+10. [Key Findings](#key-findings)
+11. [References](#references)
 
 ---
 
@@ -411,6 +412,81 @@ Our V1 baseline achieves **0.788 macro-F1**, surpassing the combined SVM from th
 
 ---
 
+## Confidence Threshold Ablation
+
+This experiment investigates how the confidence threshold used during pseudo-label generation affects model performance when training from scratch on the combined dataset (original 27K + 25K pseudo-labeled examples).
+
+All models in this ablation are trained with:
+- Base model: `nlpaueb/legal-bert-base-uncased` (from scratch, not from V1)
+- Training data: original labeled dataset (27K) + 25K pseudo-labeled examples
+- Pseudo-labeled examples sampled with `--max_samples 25000 --seed 42`
+- Confidence threshold varies: 0.5, 0.6, 0.7, 0.8, 0.9
+- All other hyperparameters identical to other experiments
+
+To reproduce this ablation:
+
+```bash
+# Generate pseudo-labeled datasets at different confidence thresholds
+for CONF in 0.5 0.6 0.7 0.8 0.9; do
+    python src/build_pseudo_dataset.py \
+        --input          data/pseudo_labeled/raw_logits.csv \
+        --output         data/pseudo_labeled/pseudo_25k_0${CONF//./}.csv \
+        --min_confidence $CONF \
+        --max_samples    25000 \
+        --seed           42
+done
+
+# Train a model for each threshold
+for CONF in 0.5 0.6 0.7 0.8 0.9; do
+    python src/train.py \
+        --model_name  nlpaueb/legal-bert-base-uncased \
+        --train_data  data/original/train.csv \
+        --extra_data  data/pseudo_labeled/pseudo_25k_0${CONF//./}.csv \
+        --val_data    data/original/val.csv \
+        --test_data   data/original/test.csv \
+        --output_dir  models/conf_ablation_${CONF//./} \
+        --num_epochs  10 --batch_size 8 --max_length 128
+done
+```
+
+### Validation Set Results
+
+| Confidence | Macro-F1 | Micro-F1 | Eval Loss | Epochs |
+|------------|----------|----------|-----------|--------|
+| 0.5        | 0.7902   | 0.9529   | 0.0336    | 10     |
+| 0.6        | 0.7857   | 0.9524   | 0.0260    | 8      |
+| 0.7        | 0.7761   | 0.9544   | 0.0205    | 6      |
+| 0.8        | 0.7863   | 0.9542   | 0.0256    | 8      |
+| 0.9        | 0.7854   | 0.9576   | 0.0276    | 8      |
+| **V1 baseline (no pseudo)** | **0.7656** | **0.9493** | **0.0187** | **6** |
+
+### Test Set Results
+
+| Confidence | Macro-F1    | Micro-F1 | Test Loss | Epochs |
+|------------|-------------|----------|-----------|--------|
+| 0.5        | 0.7771      | 0.9616   | 0.0262    | 10     |
+| 0.6        | 0.7765      | 0.9646   | 0.0200    | 8      |
+| 0.7        | 0.7682      | 0.9647   | 0.0161    | 6      |
+| 0.8        | 0.7753      | 0.9671   | 0.0202    | 8      |
+| 0.9        | 0.7771      | 0.9659   | 0.0221    | 8      |
+| **V1 baseline (no pseudo)** | **0.7881** | **0.9613** | **0.0145** | **6** |
+
+### Observations
+
+**No confidence threshold improves over V1 on the test set.** All combined models (original + 25K pseudo) score below the supervised baseline (0.7881) on macro-F1, confirming that the noise introduced by pseudo-labels partially offsets any benefit from the additional data volume.
+
+**Confidence 0.5 achieves the best validation macro-F1 (0.7902)** — higher than V1's validation score (0.7656) — but does not generalise as well to the test set (0.7771 vs 0.7881). It also required all 10 epochs to converge without triggering early stopping, suggesting the model keeps slowly improving on validation without reaching a clear peak.
+
+**Confidence 0.7 is the worst performer** on both validation (0.7761) and test (0.7682). At this threshold the pseudo-labeled positives are filtered enough to reduce volume, but not enough to eliminate noisy examples — a middle ground that yields the worst of both worlds.
+
+**Confidence 0.5 and 0.9 tie on test macro-F1 (0.7771)**, while confidence 0.8 and 0.9 are the closest competitors at 0.7753 and 0.7771 respectively. The relationship between threshold and performance is not monotonic: 0.5 ≥ 0.9 > 0.6 > 0.8 > 0.7 on test macro-F1.
+
+**Micro-F1 increases with higher confidence thresholds** (0.9616 at conf=0.5 up to 0.9671 at conf=0.8), reflecting that stricter filtering keeps only the most unambiguous positive examples, which helps the model learn frequent labels more precisely without affecting the dominant `none` class.
+
+**The gap between validation and test macro-F1 is largest for confidence 0.5** (0.7902 val vs 0.7771 test, delta=0.013), suggesting slight overfitting to the validation distribution when more pseudo-label noise is included.
+
+---
+
 ## Key Findings
 
 ### 1. Labeled data quality beats pseudo-label quantity
@@ -430,6 +506,9 @@ V1→25K (0.7194) and V1→50K (0.7144) both underperform V1 (0.788) despite sta
 
 ### 6. Micro-F1 is stable across all strategies
 All models achieve micro-F1 between 0.961 and 0.966, showing that the dominant `none` class and frequent positive labels are consistently learned. The critical challenge lies in **rare label detection**, which only supervised fine-tuning on gold-labeled data handles effectively.
+
+### 7. Confidence threshold has no clear optimal value
+The confidence threshold ablation (0.5, 0.6, 0.7, 0.9 tested) shows no monotonic relationship between threshold and test macro-F1. Confidence 0.5 performs best on validation (0.790) but not on test (0.777), while confidence 0.7 is the worst on both sets. All thresholds produce models below the V1 supervised baseline on test macro-F1, suggesting that **the problem lies in the pseudo-label quality and coverage rather than the filtering threshold**.
 
 ---
 
